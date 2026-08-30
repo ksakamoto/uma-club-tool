@@ -1,0 +1,4 @@
+horse_name,sex,birth_date,sire_name,dam_name,broodmare_sire_name,farm_name,trainer_name,stable,price_total,price_per_lot,lot_count,weight_kg,height_cm,chest_cm,cannon_cm,coat_color,year
+サンプル馬A,牡,2024-03-10,エピファネイア,サンプル母馬A,ハーツクライ,ノーザンファーム,藤原英昭,栗東,8000,400,20,488,162,187,20.8,鹿毛,2024
+サンプル馬B,牝,2024-02-20,キタサンブラック,サンプル母馬B,ディープインパクト,社台ファーム,池江泰寿,栗東,5000,250,20,462,159,183,19.5,栗毛,2024
+サンプル馬C,牡,2024-04-05,モーリス,サンプル母馬C,フランケル,白老ファーム,友道康夫,栗東,6000,300,20,496,164,191,21.2,青鹿毛,2024

@@ -1,0 +1,33 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# データベース（大容量・個人データ）
+shared/
+*.db
+*.db-wal
+*.db-shm
+
+# C# ビルド成果物
+windows_fetcher_cs/bin/
+windows_fetcher_cs/obj/
+
+# macOS
+.DS_Store
+
+# ログ・一時ファイル
+*.out
+nohup.out
+*.log
+
+# Claude Code 設定（内部ドキュメント含む）
+.claude/
+CLAUDE.md
+AGENTS.md
+
+# JRA-VAN SDK 資料（著作権のため除外）
+ref/
