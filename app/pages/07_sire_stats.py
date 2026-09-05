@@ -32,11 +32,21 @@ def _cached_available_years(db_path: str) -> list[int]:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _cached_sire_ranking(db_path: str, year: int, age_filter) -> pd.DataFrame:
+def _cached_sire_ranking(db_path: str, year: int, age_filter, sex_filter: str | None) -> pd.DataFrame:
     r = DBReader(db_path)
     r.connect()
     try:
-        return r.get_sire_ranking(year, age_filter)
+        return r.get_sire_ranking(year, age_filter, sex_filter)
+    finally:
+        r.disconnect()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_sex_condition(db_path: str, sire_code: str, year: int, age_filter) -> pd.DataFrame:
+    r = DBReader(db_path)
+    r.connect()
+    try:
+        return r.get_sire_sex_condition_breakdown(sire_code, year, age_filter)
     finally:
         r.disconnect()
 
@@ -217,6 +227,100 @@ def _build_condition_display(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 
+_TRACK_ORDER = ["芝", "ダート", "その他"]
+_DISTANCE_ORDER = ["～1400m", "1401～1800m", "1801～2200m", "2201m～"]
+
+
+def _subtotal_row(sex_label: str, track_type: str, distance_bucket: str, grp: pd.DataFrame) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "sex_label":       sex_label,
+        "track_type":      track_type,
+        "distance_bucket": distance_bucket,
+        "runs":    grp["runs"].sum(),
+        "wins":    grp["wins"].sum(),
+        "places":  grp["places"].sum(),
+        "shows":   grp["shows"].sum(),
+        "total_prize": grp["total_prize"].sum(),
+    }])
+
+
+def _build_sex_condition_display(df: pd.DataFrame) -> pd.DataFrame:
+    """性別×条件別成績テーブルを構築する。
+    構成:
+      [牡馬ブロック]
+        芝: 詳細行 → 芝小計
+        ダート: 詳細行 → ダート小計
+        牡馬小計
+      [牝馬ブロック] (同上)
+      [条件別小計] (全性別合算)
+        芝: 詳細行 → 芝小計
+        ダート: 詳細行 → ダート小計
+    """
+    if df.empty:
+        return df
+
+    rows: list[pd.DataFrame] = []
+
+    sexes = [s for s in ["牡馬", "牝馬"] if s in df["sex_label"].values]
+    for sex in sexes:
+        sex_grp = df[df["sex_label"] == sex]
+        for track in [t for t in _TRACK_ORDER if t in sex_grp["track_type"].values]:
+            track_grp = sex_grp[sex_grp["track_type"] == track]
+            dist_order = {d: i for i, d in enumerate(_DISTANCE_ORDER)}
+            track_grp = track_grp.copy()
+            track_grp["_ord"] = track_grp["distance_bucket"].map(dist_order).fillna(99)
+            track_grp = track_grp.sort_values("_ord").drop(columns="_ord")
+            rows.append(track_grp[["sex_label", "track_type", "distance_bucket", "runs", "wins", "places", "shows", "total_prize"]])
+            rows.append(_subtotal_row(sex, track, f"【{track}小計】", track_grp))
+        rows.append(_subtotal_row(f"【{sex}小計】", "", "", sex_grp))
+
+    # 条件別小計（全性別合算）
+    rows.append(pd.DataFrame([{
+        "sex_label": "─ 条件別（全体）", "track_type": "", "distance_bucket": "",
+        "runs": 0, "wins": 0, "places": 0, "shows": 0, "total_prize": 0,
+    }]))
+    for track in [t for t in _TRACK_ORDER if t in df["track_type"].values]:
+        track_grp = df[df["track_type"] == track]
+        dist_order = {d: i for i, d in enumerate(_DISTANCE_ORDER)}
+        track_grp = track_grp.copy()
+        track_grp["_ord"] = track_grp["distance_bucket"].map(dist_order).fillna(99)
+        agg = track_grp.groupby(["track_type", "distance_bucket", "_ord"], as_index=False)[["runs", "wins", "places", "shows", "total_prize"]].sum()
+        agg = agg.sort_values("_ord").drop(columns="_ord")
+        for _, r in agg.iterrows():
+            rows.append(pd.DataFrame([{
+                "sex_label": "全体", "track_type": r["track_type"], "distance_bucket": r["distance_bucket"],
+                "runs": r["runs"], "wins": r["wins"], "places": r["places"], "shows": r["shows"], "total_prize": r["total_prize"],
+            }]))
+        rows.append(_subtotal_row("全体", track, f"【{track}小計】", track_grp))
+
+    combined = pd.concat(rows, ignore_index=True)
+
+    denom = combined["runs"].replace(0, float("nan"))
+    combined["win_rate_pct"]   = (combined["wins"]   / denom * 100).round(1)
+    combined["place_rate_pct"] = (combined["places"] / denom * 100).round(1)
+    combined["show_rate_pct"]  = (combined["shows"]  / denom * 100).round(1)
+    combined["total_prize_man"] = (combined["total_prize"] / 10).round(0).astype("Int64")
+
+    # 区切り行（runs=0のダミー行）は率をブランクに
+    mask_zero = combined["runs"] == 0
+    combined.loc[mask_zero, ["win_rate_pct", "place_rate_pct", "show_rate_pct", "total_prize_man"]] = None
+
+    return combined[[
+        "sex_label", "track_type", "distance_bucket", "runs", "wins",
+        "win_rate_pct", "place_rate_pct", "show_rate_pct", "total_prize_man",
+    ]].rename(columns={
+        "sex_label":       "性別",
+        "track_type":      "馬場",
+        "distance_bucket": "距離",
+        "runs":            "出走",
+        "wins":            "勝利",
+        "win_rate_pct":    "勝率%",
+        "place_rate_pct":  "連対率%",
+        "show_rate_pct":   "複勝率%",
+        "total_prize_man": "総賞金(万円)",
+    })
+
+
 def _render_detail(sire_code: str, row: pd.Series, year: int, age_filter) -> None:
     """詳細セクション（サマリー・条件別・母父・産駒）を描画する。"""
     st.divider()
@@ -230,13 +334,25 @@ def _render_detail(sire_code: str, row: pd.Series, year: int, age_filter) -> Non
     m5.metric("総賞金",          _fmt_prize(float(row["total_prize"] or 0)))
     m6.metric("1頭あたり賞金",   _fmt_prize(float(row["prize_per_offspring"] or 0)))
 
-    st.subheader("条件別成績")
+    st.subheader("性別×条件別成績")
     with st.spinner("集計中…"):
-        cond_df = _cached_by_condition(db_path, sire_code, year, age_filter)
-    if cond_df.empty:
+        sx_df = _cached_sex_condition(db_path, sire_code, year, age_filter)
+    if sx_df.empty:
         st.info("条件別データなし")
     else:
-        st.dataframe(_build_condition_display(cond_df), use_container_width=True, hide_index=True)
+        st.dataframe(
+            _build_sex_condition_display(sx_df),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "出走":      st.column_config.NumberColumn(format="%d"),
+                "勝利":      st.column_config.NumberColumn(format="%d"),
+                "勝率%":     st.column_config.NumberColumn(format="%.1f"),
+                "連対率%":   st.column_config.NumberColumn(format="%.1f"),
+                "複勝率%":   st.column_config.NumberColumn(format="%.1f"),
+                "総賞金(万円)": st.column_config.NumberColumn(format="%d"),
+            },
+        )
 
     col_left, col_right = st.columns(2)
     with col_left:
@@ -305,8 +421,15 @@ tabs = st.tabs([label for label, _ in AGE_CONFIGS])
 
 for tab, (label, age_filter) in zip(tabs, AGE_CONFIGS):
     with tab:
+        sex_sel = st.radio(
+            "性別", ["全体", "牡馬", "牝馬"],
+            horizontal=True,
+            key=f"sex_filter_{label}",
+        )
+        sex_filter = None if sex_sel == "全体" else sex_sel
+
         with st.spinner(f"{label}戦データを集計中…"):
-            ranking_df = _cached_sire_ranking(db_path, selected_year, age_filter)
+            ranking_df = _cached_sire_ranking(db_path, selected_year, age_filter, sex_filter)
 
         if ranking_df.empty:
             st.info(f"{selected_year}年の{label}戦データがありません。")

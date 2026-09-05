@@ -1,8 +1,11 @@
 """ユーザーデータ（評価・出資記録）の読み書きクライアント。userdata.db を管理する。"""
 from __future__ import annotations
+import re
 import sqlite3
 from pathlib import Path
 import pandas as pd
+
+from app.core.application_odds import calc_odds
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS annual_horses (
@@ -49,6 +52,30 @@ CREATE TABLE IF NOT EXISTS annual_horses (
     notes           TEXT,
 
     UNIQUE(year, horse_name)
+);
+
+CREATE TABLE IF NOT EXISTS application_announcement (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    year                INTEGER NOT NULL,
+    announcement_no     INTEGER NOT NULL,
+    prev_year_ratio     REAL NOT NULL,
+    member_growth_rate  REAL DEFAULT 0.01,
+    announced_date      TEXT,
+    UNIQUE(year, announcement_no)
+);
+
+CREATE TABLE IF NOT EXISTS application_status (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    year                  INTEGER NOT NULL,
+    horse_name            TEXT NOT NULL,
+    announcement_no       INTEGER NOT NULL,
+    total_applications    INTEGER,
+    priority_tickets      INTEGER,
+    mother_general_count  INTEGER,
+    top_priority_count    INTEGER,
+    priority_quota        INTEGER DEFAULT 200,
+    total_quota           INTEGER DEFAULT 400,
+    UNIQUE(year, horse_name, announcement_no)
 );
 """
 
@@ -143,7 +170,7 @@ class UserDataWriter:
                 sex                   = excluded.sex,
                 price_total           = excluded.price_total,
                 body_weight           = excluded.body_weight,
-                body_weight_latest    = excluded.body_weight_latest,
+                body_weight_latest    = COALESCE(excluded.body_weight_latest, annual_horses.body_weight_latest),
                 height                = excluded.height,
                 chest_girth           = excluded.chest_girth,
                 cannon_bone           = excluded.cannon_bone,
@@ -156,7 +183,7 @@ class UserDataWriter:
                 score_farm            = excluded.score_farm,
                 score_siblings        = excluded.score_siblings,
                 score_physical        = excluded.score_physical,
-                score_physical_latest = excluded.score_physical_latest,
+                score_physical_latest = COALESCE(excluded.score_physical_latest, annual_horses.score_physical_latest),
                 score_mj_body         = excluded.score_mj_body,
                 score_mj_dam          = excluded.score_mj_dam,
                 score_mj_trainer      = excluded.score_mj_trainer
@@ -176,6 +203,34 @@ class UserDataWriter:
             self.upsert_horse(year, row.to_dict())
             count += 1
         return count
+
+    @staticmethod
+    def _canonical_horse_year(name: str) -> str:
+        """馬名末尾の年サフィックスを4桁年に統一する（比較専用）。
+        'スルーセブンシーズの25' → 'スルーセブンシーズの2025'
+        'スルーセブンシーズの2025' → そのまま
+        """
+        return re.sub(r'の(\d{2})$', lambda m: f'の20{m.group(1)}', name)
+
+    def _resolve_horse_name(self, year: int, input_name: str, known_names: set[str] | None = None) -> str:
+        """annual_horses の正規名と突き合わせ、の25/の2025 の揺らぎを吸収して返す。
+        マッチしない場合は入力値をそのまま返す。
+        """
+        if known_names is None:
+            rows = self.conn.execute(
+                'SELECT horse_name FROM annual_horses WHERE year = ?', (year,)
+            ).fetchall()
+            known_names = {r[0] for r in rows}
+
+        if input_name in known_names:
+            return input_name
+
+        norm_input = self._canonical_horse_year(input_name)
+        for canonical in known_names:
+            if self._canonical_horse_year(canonical) == norm_input:
+                return canonical
+
+        return input_name
 
     @staticmethod
     def _normalize_eval(v):
@@ -231,6 +286,129 @@ class UserDataWriter:
             "SELECT * FROM annual_horses ORDER BY year DESC, COALESCE(score_total, 0) DESC",
             self.conn,
         )
+
+    def upsert_application_announcement(
+        self,
+        year: int,
+        announcement_no: int,
+        prev_year_ratio: float,
+        member_growth_rate: float = 0.01,
+        announced_date: str | None = None,
+    ) -> None:
+        """公表回ごとのグローバルパラメータを登録・更新する。"""
+        self.conn.execute(
+            """
+            INSERT INTO application_announcement
+                (year, announcement_no, prev_year_ratio, member_growth_rate, announced_date)
+            VALUES (:year, :no, :ratio, :growth, :date)
+            ON CONFLICT(year, announcement_no) DO UPDATE SET
+                prev_year_ratio    = excluded.prev_year_ratio,
+                member_growth_rate = excluded.member_growth_rate,
+                announced_date     = excluded.announced_date
+            """,
+            {"year": year, "no": announcement_no, "ratio": prev_year_ratio,
+             "growth": member_growth_rate, "date": announced_date},
+        )
+        self.conn.commit()
+
+    def upsert_application_status_bulk(
+        self,
+        year: int,
+        announcement_no: int,
+        rows: list[dict],
+        priority_quota: int = 200,
+        total_quota: int = 400,
+    ) -> int:
+        """馬ごとの申込状況を一括登録・更新する。rows は horse_name + 各数値を持つ dict のリスト。
+        horse_name は annual_horses の正規名と突き合わせ、の25/の2025 の揺らぎを吸収する。
+        Returns: 処理した件数
+        """
+        # annual_horses の正規名を一度だけ取得してキャッシュ
+        known_rows = self.conn.execute(
+            'SELECT horse_name FROM annual_horses WHERE year = ?', (year,)
+        ).fetchall()
+        known_names: set[str] = {r[0] for r in known_rows}
+
+        count = 0
+        for row in rows:
+            resolved_name = self._resolve_horse_name(year, row["horse_name"], known_names)
+            self.conn.execute(
+                """
+                INSERT INTO application_status
+                    (year, horse_name, announcement_no,
+                     total_applications, priority_tickets, mother_general_count, top_priority_count,
+                     priority_quota, total_quota)
+                VALUES (:year, :name, :no, :total, :priority, :mother, :top, :pq, :tq)
+                ON CONFLICT(year, horse_name, announcement_no) DO UPDATE SET
+                    total_applications   = excluded.total_applications,
+                    priority_tickets     = excluded.priority_tickets,
+                    mother_general_count = excluded.mother_general_count,
+                    top_priority_count   = excluded.top_priority_count,
+                    priority_quota       = excluded.priority_quota,
+                    total_quota          = excluded.total_quota
+                """,
+                {
+                    "year": year, "name": resolved_name, "no": announcement_no,
+                    "total": row.get("total_applications"),
+                    "priority": row.get("priority_tickets"),
+                    "mother": row.get("mother_general_count"),
+                    "top": row.get("top_priority_count"),
+                    "pq": row.get("priority_quota", priority_quota),
+                    "tq": row.get("total_quota", total_quota),
+                },
+            )
+            count += 1
+        self.conn.commit()
+        return count
+
+    def get_application_odds_by_year(self, year: int) -> dict[str, dict]:
+        """指定年の最新公表回の申込倍率を馬名をキーとして返す。
+
+        Returns
+        -------
+        dict[horse_name, dict]:
+            keys: odds_top, odds_general, announcement_no, announced_date
+        """
+        # 最新公表回の announcement を取得
+        ann_df = pd.read_sql_query(
+            "SELECT * FROM application_announcement WHERE year = ? ORDER BY announcement_no DESC LIMIT 1",
+            self.conn, params=(year,),
+        )
+        if ann_df.empty:
+            return {}
+
+        ann = ann_df.iloc[0]
+        latest_no = int(ann["announcement_no"])
+
+        status_df = pd.read_sql_query(
+            "SELECT * FROM application_status WHERE year = ? AND announcement_no = ?",
+            self.conn, params=(year, latest_no),
+        )
+        if status_df.empty:
+            return {}
+
+        result = {}
+        for _, row in status_df.iterrows():
+            try:
+                odds = calc_odds(
+                    total=int(row["total_applications"] or 0),
+                    priority_tickets=int(row["priority_tickets"] or 0),
+                    mother_general=int(row["mother_general_count"] or 0),
+                    top_priority=int(row["top_priority_count"] or 0),
+                    prev_year_ratio=float(ann["prev_year_ratio"]),
+                    member_growth_rate=float(ann["member_growth_rate"]),
+                    priority_quota=int(row["priority_quota"] or 200),
+                    total_quota=int(row["total_quota"] or 400),
+                )
+                result[row["horse_name"]] = {
+                    "odds_top":        odds["odds_top"],
+                    "odds_general":    odds["odds_general"],
+                    "announcement_no": latest_no,
+                    "announced_date":  ann.get("announced_date"),
+                }
+            except Exception:
+                pass
+        return result
 
     def import_from_excel_rows(self, year: int, rows: list[dict]) -> tuple[int, list[str]]:
         """

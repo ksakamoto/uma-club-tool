@@ -96,6 +96,13 @@ mechanical_judgment:
     graded_wins_for_ok: 1         # ◯条件: 重賞勝利数の下限（DB 2024年以降分）
     min_career_years: 6           # 開業5年目かつ重賞0勝を判定不可とする境界（ハードコードの5年と組み合わせ）
 
+clubs:
+  carrot:
+    name: キャロットクラブ
+    priority_quota: 200       # 優先枠口数（母馬優先+最優先）
+    total_quota: 400          # 総募集口数
+    member_growth_rate: 0.01  # 会員増加率（年次補正用）
+
 scoring:
   default_years: 3
 

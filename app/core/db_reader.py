@@ -17,6 +17,18 @@ def _build_age_clause(age_filter) -> tuple[str, list]:
     return f"AND hrr.age IN ({placeholders})", list(age_filter)
 
 
+def _build_sex_clause(sex_filter: str | None) -> tuple[str, list]:
+    """sex_filter から WHERE 句フラグメントとバインドパラメータを返す。
+    sex_filter: None=全体 / '牡馬'=code IN('1','3') / '牝馬'=code='2'
+    騸馬(3)は募集時点では牡馬扱いなので牡馬グループに含める。
+    """
+    if sex_filter is None:
+        return "", []
+    if sex_filter == "牡馬":
+        return "AND hrr.sex_code IN (?, ?)", ["1", "3"]
+    return "AND hrr.sex_code = ?", ["2"]
+
+
 def parse_recruitment_name(name: str) -> tuple[str, int] | None:
     """
     「{母名}の{年}」形式の募集名を (dam_name, birth_year) に解析する。
@@ -200,9 +212,10 @@ class DBReader:
         )
         return df["yr"].tolist() if not df.empty else []
 
-    def get_sire_ranking(self, year: int, age_filter=None) -> pd.DataFrame:
-        """選択年・年齢条件での種牡馬別成績ランキング（総賞金降順）。"""
+    def get_sire_ranking(self, year: int, age_filter=None, sex_filter: str | None = None) -> pd.DataFrame:
+        """選択年・年齢条件・性別条件での種牡馬別成績ランキング（総賞金降順）。"""
         age_clause, age_params = _build_age_clause(age_filter)
+        sex_clause, sex_params = _build_sex_clause(sex_filter)
         return self.fetch_df(
             f"""
             SELECT
@@ -239,10 +252,11 @@ class DBReader:
               AND (hrr.abnormal_code IS NULL OR hrr.abnormal_code = '0')
               AND h.sire_name IS NOT NULL AND h.sire_name != ''
               {age_clause}
+              {sex_clause}
             GROUP BY h.sire_code, h.sire_name
             ORDER BY total_prize DESC
             """,
-            tuple([str(year)] + age_params),
+            tuple([str(year)] + age_params + sex_params),
         )
 
     def get_sire_by_condition(self, sire_code: str, year: int, age_filter=None) -> pd.DataFrame:
@@ -279,6 +293,45 @@ class DBReader:
               {age_clause}
             GROUP BY track_type, distance_bucket
             ORDER BY total_prize DESC
+            """,
+            tuple([sire_code, str(year)] + age_params),
+        )
+
+    def get_sire_sex_condition_breakdown(self, sire_code: str, year: int, age_filter=None) -> pd.DataFrame:
+        """指定種牡馬の性別×条件別（芝/ダ × 距離帯）成績。騸馬は牡馬に含める。"""
+        age_clause, age_params = _build_age_clause(age_filter)
+        return self.fetch_df(
+            f"""
+            SELECT
+                CASE WHEN hrr.sex_code IN ('1', '3') THEN '牡馬' ELSE '牝馬' END AS sex_label,
+                CASE
+                    WHEN r.track_code IN ('10','11','12','13','15','17','18','19') THEN '芝'
+                    WHEN r.track_code IN ('20','21','22','23','24','25') THEN 'ダート'
+                    ELSE 'その他'
+                END AS track_type,
+                CASE
+                    WHEN r.distance <= 1400 THEN '～1400m'
+                    WHEN r.distance <= 1800 THEN '1401～1800m'
+                    WHEN r.distance <= 2200 THEN '1801～2200m'
+                    ELSE '2201m～'
+                END AS distance_bucket,
+                COUNT(*)                                                               AS runs,
+                SUM(CASE WHEN hrr.finish_pos = 1 THEN 1 ELSE 0 END)                  AS wins,
+                SUM(CASE WHEN hrr.finish_pos <= 2 THEN 1 ELSE 0 END)                 AS places,
+                SUM(CASE WHEN hrr.finish_pos <= 3 THEN 1 ELSE 0 END)                 AS shows,
+                SUM(hrr.prize_won + COALESCE(hrr.extra_prize_won, 0))                AS total_prize
+            FROM horse_race_results hrr
+            JOIN horses h ON h.horse_code = hrr.horse_code
+            JOIN races r
+              ON r.kaisai_year = hrr.kaisai_year AND r.kaisai_date = hrr.kaisai_date
+              AND r.venue_code = hrr.venue_code AND r.kai = hrr.kai
+              AND r.nichi = hrr.nichi AND r.race_no = hrr.race_no
+            WHERE h.sire_code = ?
+              AND hrr.kaisai_year = ?
+              AND (hrr.abnormal_code IS NULL OR hrr.abnormal_code = '0')
+              {age_clause}
+            GROUP BY sex_label, track_type, distance_bucket
+            ORDER BY sex_label, track_type, distance_bucket
             """,
             tuple([sire_code, str(year)] + age_params),
         )

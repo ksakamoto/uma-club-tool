@@ -6,6 +6,7 @@ import pandas as pd
 
 from app.core.session_init import ensure_session
 from app.core.userdata_writer import UserDataWriter
+from app.core.application_odds import format_odds
 
 EVAL_VIDEO_OPTIONS   = ["", "◎", "◯", "▲", "△", "×"]
 EVAL_OVERALL_OPTIONS = ["", "◎", "◯", "×", "★"]
@@ -13,21 +14,63 @@ MJ_OPTIONS           = ["◎", "◯", "▲", "△", "×"]
 
 EVAL_COLS = ["eval_video", "eval_overall", "applied", "won", "notes"]
 
+_RANK_TARGETS = [
+    "total_score",
+    "score_sire", "score_trainer", "score_farm",
+    "score_siblings", "score_physical", "score_physical_latest",
+    "weight_diff",
+]
+
 COLUMN_ORDER = [
     "detail_url",
     "recruit_no", "horse_name",
     "sex", "sire_name", "broodmare_sire_name",
     "stable", "trainer_name", "price_total",
     "birth_date",
-    "weight_kg", "weight_kg_latest", "weight_diff",
+    "weight_kg", "weight_kg_latest", "weight_diff", "rank_weight_diff",
     "height_cm", "chest_cm", "cannon_cm",
-    "total_score",
+    "total_score", "rank_total_score",
     "grade_mj_body", "grade_mj_dam", "grade_mj_trainer",
-    "score_sire", "score_trainer", "score_farm",
-    "score_siblings", "score_physical", "score_physical_latest",
+    "score_sire", "rank_score_sire",
+    "score_trainer", "rank_score_trainer",
+    "score_farm", "rank_score_farm",
+    "score_siblings", "rank_score_siblings",
+    "score_physical", "rank_score_physical",
+    "score_physical_latest", "rank_score_physical_latest",
+    "odds_top", "odds_general", "announcement_label",
     "eval_video", "eval_overall", "applied", "won",
     "notes",
 ]
+
+
+def _make_badge_fn(lo: float, hi: float):
+    def _badge(v):
+        if pd.isna(v):
+            return ""
+        if v >= hi:
+            return "🟢"
+        if v <= lo:
+            return "🔴"
+        return ""
+    return _badge
+
+
+def _add_rank_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for col in _RANK_TARGETS:
+        rank_col = f"rank_{col}"
+        if col not in df.columns:
+            df[rank_col] = ""
+            continue
+        series = pd.to_numeric(df[col], errors="coerce")
+        valid = series.dropna()
+        if len(valid) < 2:
+            df[rank_col] = ""
+            continue
+        p15 = series.quantile(0.15)
+        p85 = series.quantile(0.85)
+        df[rank_col] = series.map(_make_badge_fn(p15, p85))
+    return df
 
 
 def _eval_snapshot(df: pd.DataFrame, cols: list[str]) -> dict[str, dict]:
@@ -66,6 +109,33 @@ if _ud and year and any(c not in df.columns for c in EVAL_COLS):
         for col in EVAL_COLS:
             if col not in df.columns:
                 df[col] = None
+
+# 申込倍率を userdata.db から取得して df に結合（公表データがない馬は "-"）
+if _ud and year:
+    try:
+        _odds_map = _ud.get_application_odds_by_year(year)
+        if _odds_map:
+            df["odds_top"] = df["horse_name"].map(
+                lambda n: format_odds(_odds_map[n]["odds_top"]) if n in _odds_map else "-"
+            )
+            df["odds_general"] = df["horse_name"].map(
+                lambda n: format_odds(_odds_map[n]["odds_general"]) if n in _odds_map else "-"
+            )
+            df["announcement_label"] = df["horse_name"].map(
+                lambda n: f"第{_odds_map[n]['announcement_no']}回" if n in _odds_map else "-"
+            )
+        else:
+            df["odds_top"] = "-"
+            df["odds_general"] = "-"
+            df["announcement_label"] = "-"
+    except Exception:
+        df["odds_top"] = "-"
+        df["odds_general"] = "-"
+        df["announcement_label"] = "-"
+else:
+    df["odds_top"] = "-"
+    df["odds_general"] = "-"
+    df["announcement_label"] = "-"
 
 # --- フィルタ（ページ上部に統合） ---
 sex_options     = ["全て"] + sorted(df["sex"].dropna().unique().tolist())
@@ -186,6 +256,7 @@ display_df = df.copy()
 display_df["detail_url"] = display_df["horse_name"].apply(
     lambda n: f"horse_detail?horse={urllib.parse.quote(str(n))}"
 )
+display_df = _add_rank_indicators(display_df)
 
 visible_cols = [c for c in COLUMN_ORDER if c in display_df.columns]
 display_df = display_df[visible_cols].reset_index(drop=True)
@@ -203,20 +274,33 @@ col_config = {
     "weight_kg":             st.column_config.NumberColumn("馬体重kg", format="%.1f"),
     "weight_kg_latest":      st.column_config.NumberColumn("直近体重kg", format="%.1f"),
     "weight_diff":           st.column_config.NumberColumn("増減kg", format="%+.1f"),
+    "rank_weight_diff":      st.column_config.TextColumn("▲", width=40),
     "height_cm":             st.column_config.NumberColumn("高さcm", format="%.1f"),
     "chest_cm":              st.column_config.NumberColumn("胸囲cm", format="%.1f"),
     "cannon_cm":             st.column_config.NumberColumn("管周cm", format="%.1f"),
     "total_score":           st.column_config.ProgressColumn("総合スコア", min_value=0, max_value=100, format="%.1f"),
+    "rank_total_score":      st.column_config.TextColumn("▲", width=40),
     "grade_mj_body":         st.column_config.TextColumn("馬体判定", width="small"),
     "grade_mj_dam":          st.column_config.TextColumn("母馬判定", width="small"),
     "grade_mj_trainer":      st.column_config.TextColumn("調教師判定", width="small"),
-    "score_sire":            st.column_config.NumberColumn("父S", format="%.1f"),
-    "score_trainer":         st.column_config.NumberColumn("調教師S", format="%.1f"),
-    "score_farm":            st.column_config.NumberColumn("牧場S", format="%.1f"),
-    "score_siblings":        st.column_config.NumberColumn("兄弟S", format="%.1f"),
-    "score_physical":        st.column_config.NumberColumn("測尺S", format="%.1f"),
-    "score_physical_latest": st.column_config.NumberColumn("直近体重S", format="%.1f"),
+    "score_sire":                  st.column_config.NumberColumn("父S", format="%.1f"),
+    "rank_score_sire":             st.column_config.TextColumn("▲", width=40),
+    "score_trainer":               st.column_config.NumberColumn("調教師S", format="%.1f"),
+    "rank_score_trainer":          st.column_config.TextColumn("▲", width=40),
+    "score_farm":                  st.column_config.NumberColumn("牧場S", format="%.1f"),
+    "rank_score_farm":             st.column_config.TextColumn("▲", width=40),
+    "score_siblings":              st.column_config.NumberColumn("兄弟S", format="%.1f"),
+    "rank_score_siblings":         st.column_config.TextColumn("▲", width=40),
+    "score_physical":              st.column_config.NumberColumn("測尺S", format="%.1f"),
+    "rank_score_physical":         st.column_config.TextColumn("▲", width=40),
+    "score_physical_latest":       st.column_config.NumberColumn("直近体重S", format="%.1f"),
+    "rank_score_physical_latest":  st.column_config.TextColumn("▲", width=40),
     "price_total":           st.column_config.NumberColumn("募集額(万)", format="%d"),
+    "odds_top":              st.column_config.TextColumn("最優先倍率", width=80,
+                                 help="最優先の推計倍率（当確=1倍未満、-=未公表）"),
+    "odds_general":          st.column_config.TextColumn("一般倍率", width=80,
+                                 help="一般申込の推計倍率（-=最優先でも落選リスクあり or 未公表）"),
+    "announcement_label":    st.column_config.TextColumn("公表回", width=60),
     "eval_video":            st.column_config.SelectboxColumn(
         "動画/現場", options=EVAL_VIDEO_OPTIONS, width="small"),
     "eval_overall":          st.column_config.SelectboxColumn(
